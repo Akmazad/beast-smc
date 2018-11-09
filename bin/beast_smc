@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+# Author: Aaron Darling
+# Author: Mathieu Fourment
+# TODO: PEPify with docstrings
+#
+import sys
+import argparse
+import os
+import math
+import xml.etree.ElementTree as ET
+
+def ESS(weights):
+    sum = 0
+    sumsq = 0
+    for w in weights:
+        sum += math.exp(w)
+    for w in weights:
+        sumsq += math.exp(2.0 * w)
+    return math.exp(-math.log(sumsq) + 2 * math.log(sum));
+
+def parse_taxon_list(xml_path):
+    xml_tree = ET.parse(xml_path)
+    taxa = xml_tree.find('taxa')
+    taxa_set = set()
+    for taxon in taxa.findall('taxon'):
+        taxa_set.add(taxon.attrib['id'])
+    return taxa_set
+
+def read_ll(checkpoint_file):
+    wf = open(checkpoint_file, 'r')
+    for line in wf:
+        if line.startswith('lnL'):
+            ll = line.split('\t')
+            return float(ll[1])
+    return 0 #TODO: throw an error here
+
+parser = argparse.ArgumentParser(description='Add sequences to a BEAST run using SMC.')
+parser.add_argument('--checkpoint_dir', metavar='cpdir', type=str,
+                    help='the location of the BEAST checkpoint directory',
+                    required=True)
+parser.add_argument('--original_xml', type=str, help='The original BEAST XML file',
+                    required=True)
+parser.add_argument('--new_xml', type=str, help='The BEAST XML file with new sequences',
+                    required=True)
+parser.add_argument('--particles', type=int,
+                    help='The number of particles to use', default=1000)
+parser.add_argument('--mcmc_iters', type=int,
+                    help='The number of MCMC iterations after each' \
+                    ' sequence addition', default=500)
+parser.add_argument('--beast', type=str, help='The full path to the beast.jar',
+                    default='beast.jar')
+parser.add_argument('--output', type=str, help='A destination directory for output',
+                    default='output')
+args = parser.parse_args()
+
+beast_path = os.path.abspath(args.beast)
+orig_xml_path = os.path.abspath(args.original_xml)
+new_xml_path = os.path.abspath(args.new_xml)
+
+# parse the original BEAST XML to get a taxon list
+orig_taxa_set = parse_taxon_list(orig_xml_path)
+
+# parse the new BEAST XML to find the new taxa
+new_taxa_set = parse_taxon_list(new_xml_path)
+
+taxa_to_add = new_taxa_set.difference(orig_taxa_set)
+
+cp_files = os.listdir(args.checkpoint_dir)
+if len(cp_files) < args.particles:
+    sys.stderr.write('ERROR: number of particles requested exceeds number ' \
+    'of MCMC checkpoints. Set --particles to a smaller value or run more MCMC '
+    'on your original data set.\n\n')
+    sys.exit(-1)
+p_count = args.particles
+
+# set up particles for iteration 0 from MCMC checkpoints
+os.mkdir(args.output)
+os.mkdir(args.output+"/iteration.0")
+prev_ll = [None] * p_count
+for i in range(p_count):
+    particle_dir = args.output+"/iteration.0/particle."+str(i)
+    os.mkdir(particle_dir)
+    # TODO: when there's an excess of checkpoint files, select in a less arbitrary manner
+    os.system("cp "+args.checkpoint_dir+'/'+cp_files[i]+" "+particle_dir+"/particle.ckpnt")
+
+# now start hybrid SMC/MCMC iterations to add new taxa
+iter = 0
+added_taxa = set()
+for taxon in taxa_to_add:
+    iter+=1
+    iterdir = args.output+"/iteration."+str(iter)
+    os.mkdir(iterdir)
+    weights = [None] * p_count
+    new_ll = [None] * p_count
+    for p_id in range(p_count):
+        particle_dir = iterdir+"/particle."+str(p_id)
+        os.mkdir(particle_dir)
+        ckpnt_file = particle_dir + '/particle.ckpnt'
+        ptrees_file = particle_dir + '/particle.trees'
+        plog_file = particle_dir + '/particle.log'
+        pxml_file = particle_dir + '/beast.xml'
+        pout_file = particle_dir + '/beast.add.out'
+        perr_file = particle_dir + '/beast.add.err'
+
+        # remove any taxa and associated sequences that we are not yet ready to add
+        added_taxa.add(taxon)
+        remove_taxa = taxa_to_add.difference(added_taxa)
+        pxml_tree = ET.parse(args.new_xml)
+        taxa = pxml_tree.find('taxa')
+        for t in taxa.findall('taxon'):
+            if t.attrib['id'] in remove_taxa:
+                taxa.remove(t)
+        alignment = pxml_tree.find('alignment')
+        for s in alignment.findall('sequence'):
+            if s[0].attrib['idref'] in remove_taxa: # gets the taxon for the sequence
+                alignment.remove(s)
+        # set the log file names for this particle
+        mcmc = pxml_tree.find('mcmc')
+        mcmc.attrib['chainLength']=str(args.mcmc_iters)
+        for l in mcmc.findall('log'):
+            l.attrib['logEvery']=str(args.mcmc_iters)
+            if l.attrib['id']=='fileLog':
+                l.attrib['fileName']=plog_file
+        lt = mcmc.find('logTree')
+        lt.attrib['fileName']=ptrees_file
+        lt.attrib['logEvery']=str(args.mcmc_iters)
+        # TODO: add the targeted operator to the new XML
+        pxml_tree.write(pxml_file)
+
+        prev_ckpnt_file = args.output+"/iteration."+str(iter-1)+"/particle."+str(p_id)+"/particle.ckpnt"
+        new_ckpnt_file = iterdir+"/particle."+str(p_id)+"/particle.ckpnt"
+        java_cmd = 'java -cp ' + beast_path + ' dr.app.realtime.CheckPointUpdaterApp ' \
+            ' -BEAST_XML ' + pxml_file + \
+            ' -load_dump ' + prev_ckpnt_file + \
+            ' -update_choice F84Distance ' + \
+            ' -output_file ' + new_ckpnt_file + \
+            ' > ' + pout_file + \
+            ' 2> ' + perr_file
+        print(java_cmd)
+        os.system(java_cmd)
+
+        # read the new log likelihood
+        prev_ll[p_id] = read_ll(prev_ckpnt_file)
+        new_ll[p_id] = read_ll(new_ckpnt_file)
+        weights[p_id] = new_ll[p_id] - prev_ll[p_id]
+
+    # compute the ESS
+    ess = ESS(weights)
+    print("ESS: "+str(ess))
+
+    # optionally do resampling
+    print("weights are:")
+    print(weights)
+    prev_ll = new_ll
+
+    # now run MCMC on each particle
+    for p_id in range(p_count):
+        particle_dir = iterdir + '/' + 'particle.'+str(p_id)
+        ckpnt_file = particle_dir + '/particle.ckpnt'
+        mcmc_ckpnt_file = particle_dir + '/particle.mcmc.ckpnt'
+        pxml_file = particle_dir + '/beast.xml'
+        pout_file = particle_dir + '/beast.mcmc.out'
+        perr_file = particle_dir + '/beast.mcmc.err'
+
+        java_cmd = 'java -jar ' + beast_path + \
+            ' -load_dump ' + ckpnt_file + \
+            ' -dump_state ' + str(args.mcmc_iters) + \
+            ' -save_dump ' + mcmc_ckpnt_file + \
+            ' -force_resume ' + \
+            ' -overwrite ' + \
+            pxml_file + \
+            ' > ' + pout_file + \
+            ' 2> ' + perr_file
+        print(java_cmd)
+        os.system(java_cmd)
+        os.system('mv '+mcmc_ckpnt_file+' '+ckpnt_file)
