@@ -8,7 +8,20 @@ import argparse
 import os
 import math
 import xml.etree.ElementTree as ET
-from shutil import copyfile
+from shutil import copyfile, rmtree
+import numpy as np
+
+
+def resample_multinomial(weights):
+    w = np.exp(weights)
+    w /= sum(w)
+    res = np.random.multinomial(len(weights), w)
+    pIndexes = []
+    for idx, count in enumerate(res):
+        if count > 0:
+            pIndexes.extend([idx]*count)
+    assert len(pIndexes) == len(weights)
+    return pIndexes
 
 
 def ESS(weights):
@@ -56,7 +69,15 @@ parser.add_argument('--beast', type=str, help='The full path to the beast.jar',
                     default='beast.jar')
 parser.add_argument('--output', type=str, help='A destination directory for output',
                     default='output')
+parser.add_argument('--threshold', type=float, help='Resampling threshold. If threshold is positive and less than 1'
+                                                    'then resampling is triggered when ESS < threshold*particles. If'
+                                                    ' threshold > 1 then resampling is triggered when threshold < ESS.',
+                    default=0.5)
+parser.add_argument('--overwrite', help='Overwrite output folder', action='store_true')
 args = parser.parse_args()
+
+if os.path.lexists(args.output) and args.overwrite:
+    rmtree(args.output)
 
 beast_path = os.path.abspath(args.beast)
 orig_xml_path = os.path.abspath(args.original_xml)
@@ -78,15 +99,23 @@ if len(cp_files) < args.particles:
     sys.exit(-1)
 p_count = args.particles
 
+threshold = args.threshold
+if args.threshold < 1:
+    threshold = args.threshold*p_count
+
 # set up particles for iteration 0 from MCMC checkpoints
-os.mkdir(args.output)
-os.mkdir(os.path.join(args.output, "iteration.0"))
-prev_ll = [None] * p_count
+os.makedirs(os.path.join(args.output, "iteration.0"))
+prev_ll = np.zeros(p_count)
+ckpnts = range(p_count)
+weights = [0]*p_count
+
 for i in range(p_count):
     particle_dir = os.path.join(args.output, "iteration.0", "particle."+str(i))
     os.mkdir(particle_dir)
+    ckpnt_file = os.path.join(particle_dir, 'particle.ckpnt')
     # TODO: when there's an excess of checkpoint files, select in a less arbitrary manner
-    copyfile(os.path.join(args.checkpoint_dir, cp_files[i]), os.path.join(particle_dir, "particle.ckpnt"))
+    copyfile(os.path.join(args.checkpoint_dir, cp_files[i]), ckpnt_file)
+    prev_ll[i] = read_ll(ckpnt_file)
 
 # now start hybrid SMC/MCMC iterations to add new taxa
 iter = 0
@@ -95,8 +124,7 @@ for taxon in taxa_to_add:
     iter+=1
     iterdir = os.path.join(args.output, "iteration."+str(iter))
     os.mkdir(iterdir)
-    weights = [None] * p_count
-    new_ll = [None] * p_count
+    new_ll = np.zeros(p_count)
     for p_id in range(p_count):
         particle_dir = os.path.join(iterdir, "particle."+str(p_id))
         os.mkdir(particle_dir)
@@ -132,7 +160,7 @@ for taxon in taxa_to_add:
         # TODO: add the targeted operator to the new XML
         pxml_tree.write(pxml_file)
 
-        prev_ckpnt_file = os.path.join(args.output, "iteration."+str(iter-1), "particle."+str(p_id), "particle.ckpnt")
+        prev_ckpnt_file = os.path.join(args.output, "iteration."+str(iter-1), "particle."+str(ckpnts[p_id]), "particle.ckpnt")
         new_ckpnt_file = os.path.join(iterdir, "particle."+str(p_id), "particle.ckpnt")
         java_cmd = 'java -cp ' + beast_path + ' dr.app.realtime.CheckPointUpdaterApp ' \
             ' -BEAST_XML ' + pxml_file + \
@@ -145,9 +173,8 @@ for taxon in taxa_to_add:
         os.system(java_cmd)
 
         # read the new log likelihood
-        prev_ll[p_id] = read_ll(prev_ckpnt_file)
         new_ll[p_id] = read_ll(new_ckpnt_file)
-        weights[p_id] = new_ll[p_id] - prev_ll[p_id]
+        weights[p_id] += new_ll[p_id] - prev_ll[p_id]
 
     # compute the ESS
     ess = ESS(weights)
@@ -156,7 +183,19 @@ for taxon in taxa_to_add:
     # optionally do resampling
     print("weights are:")
     print(weights)
-    prev_ll = new_ll
+
+    if ess < threshold:
+        print("Resampling")
+        ckpnts = resample_multinomial(weights)
+        print(ckpnts)
+        weights = [1.0/p_count]*p_count
+        prev_ll = new_ll[ckpnts]
+    else:
+        prev_ll = new_ll
+        ckpnts = range(p_count)
+
+    if args.mcmc_iters <= 0:
+        continue
 
     # now run MCMC on each particle
     for p_id in range(p_count):
@@ -168,7 +207,7 @@ for taxon in taxa_to_add:
         perr_file = os.path.join(particle_dir, 'beast.mcmc.err')
 
         java_cmd = 'java -jar ' + beast_path + \
-            ' -load_state ' + ckpnt_file + \
+            ' -load_state ' + os.path.join(iterdir, 'particle.{}'.format(ckpnts[p_id]), 'particle.ckpnt') + \
             ' -save_at ' + str(args.mcmc_iters) + \
             ' -save_state ' + mcmc_ckpnt_file + \
             ' -force_resume ' + \
@@ -179,3 +218,8 @@ for taxon in taxa_to_add:
         print(java_cmd)
         os.system(java_cmd)
         os.system('mv '+mcmc_ckpnt_file+' '+ckpnt_file)
+
+        # read the new log likelihood
+        prev_ll[p_id] = read_ll(ckpnt_file)
+
+    ckpnts = range(p_count)
