@@ -10,6 +10,7 @@ import math
 import xml.etree.ElementTree as ET
 from shutil import copyfile, rmtree
 import numpy as np
+from functools import partial
 
 
 def resample_multinomial(weights):
@@ -21,6 +22,41 @@ def resample_multinomial(weights):
         if count > 0:
             pIndexes.extend([idx]*count)
     assert len(pIndexes) == len(weights)
+    return pIndexes
+
+
+def resample_systematic(weights, stratified=False):
+    # Procedure for stratified sampling
+    # See Appendix of Kitagawa 1996, http://www.jstor.org/stable/1390750,
+    # or p.290 of the Doucet et al book, an image of which is at:
+    # http://cl.ly/image/200T0y473k1d/stratified_resampling.jpg
+
+    w = np.exp(weights)
+    w /= sum(w)
+
+    cum = 0
+    r = np.random.random_sample() * 1.0/len(weights)
+
+    uCount = np.zeros(len(weights), dtype=np.int)
+    j = 0
+    for i, weight in enumerate(w):
+        cum += weight
+        while cum > ((float(j) / len(w)) + r):
+            uCount[i] += 1
+            j += 1
+
+            # The only difference between stratified and systematic resampling
+            # is whether a new random variable is drawn for each partition of
+            # the (0, 1] interval.
+            if stratified:
+                r = np.random.random_sample() * 1.0/len(weights)
+
+    pIndexes = []
+    for idx, count in enumerate(uCount):
+        if count > 0:
+            pIndexes.extend([idx]*count)
+    assert len(pIndexes) == len(weights)
+
     return pIndexes
 
 
@@ -65,21 +101,31 @@ parser.add_argument('--particles', type=int,
 parser.add_argument('--mcmc_iters', type=int,
                     help='The number of MCMC iterations after each' \
                     ' sequence addition', default=500)
-parser.add_argument('--beast', type=str, help='The full path to the beast.jar',
-                    default='beast.jar')
+parser.add_argument('--beast', type=str, help='The full path to the beast release')
 parser.add_argument('--output', type=str, help='A destination directory for output',
                     default='output')
 parser.add_argument('--threshold', type=float, help='Resampling threshold. If threshold is positive and less than 1'
                                                     'then resampling is triggered when ESS < threshold*particles. If'
                                                     ' threshold > 1 then resampling is triggered when threshold < ESS.',
                     default=0.5)
+parser.add_argument('--sampling', default='multinomial', choices=['multinomial', 'stratified', 'systematic'],
+                    help='Sampling method')
 parser.add_argument('--overwrite', help='Overwrite output folder', action='store_true')
 args = parser.parse_args()
 
 if os.path.lexists(args.output) and args.overwrite:
     rmtree(args.output)
 
+resample_stratified = partial(resample_systematic, stratified=True)
+resample = {
+    'systematic': resample_systematic,
+    'stratified': resample_stratified,
+    'multinomial': resample_multinomial,
+}
+
 beast_path = os.path.abspath(args.beast)
+beast_lib = '"{}"'.format(os.path.join(beast_path, 'lib', 'beast.jar'))
+beast_exe = '"{}"'.format(os.path.join(beast_path, 'bin', 'beast'))
 orig_xml_path = os.path.abspath(args.original_xml)
 new_xml_path = os.path.abspath(args.new_xml)
 
@@ -92,6 +138,7 @@ new_taxa_set = parse_taxon_list(new_xml_path)
 taxa_to_add = new_taxa_set.difference(orig_taxa_set)
 
 cp_files = os.listdir(args.checkpoint_dir)
+cp_files = [f for f in cp_files if f.startswith('beast_state')]
 if len(cp_files) < args.particles:
     sys.stderr.write('ERROR: number of particles requested exceeds number '
     'of MCMC checkpoints. Set --particles to a smaller value or run more MCMC '
@@ -162,7 +209,7 @@ for taxon in taxa_to_add:
 
         prev_ckpnt_file = os.path.join(args.output, "iteration."+str(iter-1), "particle."+str(ckpnts[p_id]), "particle.ckpnt")
         new_ckpnt_file = os.path.join(iterdir, "particle."+str(p_id), "particle.ckpnt")
-        java_cmd = 'java -cp ' + beast_path + ' dr.app.realtime.CheckPointUpdaterApp ' \
+        java_cmd = 'java -cp ' + beast_lib + ' dr.app.realtime.CheckPointUpdaterApp ' \
             ' -BEAST_XML ' + pxml_file + \
             ' -load_state ' + prev_ckpnt_file + \
             ' -update_choice F84Distance ' + \
@@ -186,7 +233,7 @@ for taxon in taxa_to_add:
 
     if ess < threshold:
         print("Resampling")
-        ckpnts = resample_multinomial(weights)
+        ckpnts = resample[args.sampling](weights)
         print(ckpnts)
         weights = [1.0/p_count]*p_count
         prev_ll = new_ll[ckpnts]
@@ -206,7 +253,7 @@ for taxon in taxa_to_add:
         pout_file = os.path.join(particle_dir, 'beast.mcmc.out')
         perr_file = os.path.join(particle_dir, 'beast.mcmc.err')
 
-        java_cmd = 'java -jar ' + beast_path + \
+        java_cmd = 'java -jar ' + beast_lib + \
             ' -load_state ' + os.path.join(iterdir, 'particle.{}'.format(ckpnts[p_id]), 'particle.ckpnt') + \
             ' -save_at ' + str(args.mcmc_iters) + \
             ' -save_state ' + mcmc_ckpnt_file + \
