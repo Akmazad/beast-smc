@@ -11,6 +11,8 @@ import xml.etree.ElementTree as ET
 from shutil import copyfile, rmtree
 import numpy as np
 from functools import partial
+import subprocess
+from subprocess import check_call
 
 
 def resample_multinomial(weights):
@@ -88,6 +90,114 @@ def read_ll(checkpoint_file):
     return 0 #TODO: throw an error here
 
 
+# Runs a single instance of BEAST on every particle
+def beast_smc():
+    os.makedirs(os.path.join(args.output, "iteration.0"))
+    prev_ll = np.zeros(p_count)
+    ckpnts = range(p_count)
+    weights = [0]*p_count
+    added_taxa = set()
+
+    for i in range(p_count):
+        ckpnt_file = os.path.join(args.output, "iteration.0", 'particle{}.part.out'.format(i))
+        copyfile(os.path.join(args.checkpoint_dir, cp_files[i]), ckpnt_file)
+        prev_ll[i] = read_ll(ckpnt_file)
+
+    iter = 0
+    for taxon in taxa_to_add:
+        iter += 1
+        iterdir = os.path.join(args.output, "iteration." + str(iter))
+        os.mkdir(iterdir)
+        new_ll = np.zeros(p_count)
+
+        ptrees_file = os.path.join(iterdir, 'particle.trees')
+        plog_file = os.path.join(iterdir, 'particle.log')
+        pxml_file = os.path.join(iterdir, 'beast.xml')
+        pout_file = os.path.join(iterdir, 'beast.add.out')
+        perr_file = os.path.join(iterdir, 'beast.add.err')
+
+        # remove any taxa and associated sequences that we are not yet ready to add
+        added_taxa.add(taxon)
+        remove_taxa = taxa_to_add.difference(added_taxa)
+        pxml_tree = ET.parse(args.new_xml)
+        taxa = pxml_tree.find('taxa')
+        for t in taxa.findall('taxon'):
+            if t.attrib['id'] in remove_taxa:
+                taxa.remove(t)
+        alignment = pxml_tree.find('alignment')
+        for s in alignment.findall('sequence'):
+            if s[0].attrib['idref'] in remove_taxa:  # gets the taxon for the sequence
+                alignment.remove(s)
+        # set the log file names for this particle
+        mcmc = pxml_tree.find('mcmc')
+        mcmc.attrib['chainLength'] = str(args.mcmc_iters)
+        for l in mcmc.findall('log'):
+            l.attrib['logEvery'] = str(args.mcmc_iters)
+            if l.attrib['id'] == 'fileLog':
+                l.attrib['fileName'] = plog_file
+        lt = mcmc.find('logTree')
+        lt.attrib['fileName'] = ptrees_file
+        lt.attrib['logEvery'] = str(args.mcmc_iters)
+        # TODO: add the targeted operator to the new XML
+        pxml_tree.write(pxml_file)
+
+        previous_iter = os.path.join(args.output, 'iteration.{}'.format(iter - 1))
+        for p_id in range(p_count):
+            prev_ckpnt_file = os.path.join(previous_iter, "particle{}.part.out".format(ckpnts[p_id]))
+            new_ckpnt_file = os.path.join(iterdir, 'particle{}.part'.format(p_id))
+            java_cmd = 'java -cp ' + beast_lib + ' dr.app.realtime.CheckPointUpdaterApp ' \
+                                                 ' -BEAST_XML ' + pxml_file + \
+                       ' -load_state ' + prev_ckpnt_file + \
+                       ' -update_choice F84Distance ' + \
+                       ' -output_file ' + new_ckpnt_file + \
+                       ' > ' + pout_file + \
+                       ' 2> ' + perr_file
+            print(java_cmd)
+            os.system(java_cmd)
+
+            if os.path.lexists(plog_file):
+                os.remove(plog_file)
+            if os.path.lexists(ptrees_file):
+                os.remove(ptrees_file)
+
+            # read the new log likelihood
+            new_ll[p_id] = read_ll(new_ckpnt_file)
+            weights[p_id] += new_ll[p_id] - prev_ll[p_id]
+
+        # compute the ESS
+        ess = ESS(weights)
+        print("ESS: " + str(ess))
+
+        # optionally do resampling
+        print("weights are:")
+        print(weights)
+
+        if ess < threshold:
+            print("Resampling")
+            ckpnts = resample[args.sampling](weights)
+            print(ckpnts)
+            weights = [1.0 / p_count] * p_count
+            prev_ll = new_ll[ckpnts]
+        else:
+            prev_ll = new_ll
+            ckpnts = range(p_count)
+
+        if args.mcmc_iters <= 0:
+            continue
+
+        # run MCMC on all particles
+        cmd = (beast_exe, '-particles', iterdir, '-overwrite ', pxml_file)
+        print(' '.join(cmd))
+        with open(os.devnull, 'w') as FNULL:
+            check_call(cmd, stdout=FNULL, stderr=FNULL)
+
+        for p_id in range(p_count):
+            ckpnt_file = os.path.join(iterdir, 'particle{}.part.out'.format(p_id))
+            prev_ll[p_id] = read_ll(ckpnt_file)
+
+        ckpnts = range(p_count)
+
+
 parser = argparse.ArgumentParser(description='Add sequences to a BEAST run using SMC.')
 parser.add_argument('--checkpoint_dir', metavar='cpdir', type=str,
                     help='the location of the BEAST checkpoint directory',
@@ -125,7 +235,7 @@ resample = {
 
 beast_path = os.path.abspath(args.beast)
 beast_lib = '"{}"'.format(os.path.join(beast_path, 'lib', 'beast.jar'))
-beast_exe = '"{}"'.format(os.path.join(beast_path, 'bin', 'beast'))
+beast_exe = os.path.join(beast_path, 'bin', 'beast')
 orig_xml_path = os.path.abspath(args.original_xml)
 new_xml_path = os.path.abspath(args.new_xml)
 
@@ -149,6 +259,11 @@ p_count = args.particles
 threshold = args.threshold
 if args.threshold < 1:
     threshold = args.threshold*p_count
+
+one_beast = True
+if one_beast:
+    beast_smc()
+    exit(0)
 
 # set up particles for iteration 0 from MCMC checkpoints
 os.makedirs(os.path.join(args.output, "iteration.0"))
