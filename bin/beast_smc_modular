@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+# Author: Aaron Darling
+# Author: Mathieu Fourment
+# TODO: PEPify with docstrings
+#
+import sys
+import argparse
+import os
+import math
+import xml.etree.ElementTree as ET
+from shutil import copyfile, rmtree, copy2
+import numpy as np
+from functools import partial
+
+def resample_multinomial(weights):
+    w = np.exp(weights)
+    w /= sum(w)
+    res = np.random.multinomial(len(weights), w)
+    pIndexes = []
+    for idx, count in enumerate(res):
+        if count > 0:
+            pIndexes.extend([idx]*count)
+    assert len(pIndexes) == len(weights)
+    return pIndexes
+
+
+def resample_systematic(weights, stratified=False):
+    # Procedure for stratified sampling
+    # See Appendix of Kitagawa 1996, http://www.jstor.org/stable/1390750,
+    # or p.290 of the Doucet et al book, an image of which is at:
+    # http://cl.ly/image/200T0y473k1d/stratified_resampling.jpg
+
+    w = np.exp(weights)
+    w /= sum(w)
+
+    cum = 0
+    r = np.random.random_sample() * 1.0/len(weights)
+
+    uCount = np.zeros(len(weights), dtype=np.int)
+    j = 0
+    for i, weight in enumerate(w):
+        cum += weight
+        while cum > ((float(j) / len(w)) + r):
+            uCount[i] += 1
+            j += 1
+
+            # The only difference between stratified and systematic resampling
+            # is whether a new random variable is drawn for each partition of
+            # the (0, 1] interval.
+            if stratified:
+                r = np.random.random_sample() * 1.0/len(weights)
+
+    pIndexes = []
+    for idx, count in enumerate(uCount):
+        if count > 0:
+            pIndexes.extend([idx]*count)
+    assert len(pIndexes) == len(weights)
+
+    return pIndexes
+
+
+def ESS(weights):
+    sum = 0
+    sumsq = 0
+    for w in weights:
+        sum += math.exp(w)
+    for w in weights:
+        sumsq += math.exp(2.0 * w)
+    return math.exp(-math.log(sumsq) + 2 * math.log(sum))
+
+
+def parse_taxon_list(xml_path):
+    xml_tree = ET.parse(xml_path)
+    taxa = xml_tree.find('taxa')
+    taxa_set = set()
+    for taxon in taxa.findall('taxon'):
+        taxa_set.add(taxon.attrib['id'])
+    return taxa_set
+
+
+def read_ll(checkpoint_file):
+    wf = open(checkpoint_file, 'r')
+    for line in wf:
+        if line.startswith('lnL'):
+            ll = line.split('\t')
+            return float(ll[1])
+    return 0 #TODO: throw an error here
+
+
+def prep_smc():
+    # set up particles from MCMC checkpoints
+    ckpnts = range(p_count)
+
+    taxon = next(iter(taxa_to_add))
+    added_taxa = set()
+    instances = math.ceil(p_count / args.ppi)
+    for i in range(instances):
+        group_dir = os.path.join(args.output, "group."+str(i))
+        os.mkdir(group_dir)
+        plist_file = os.path.join(group_dir, 'particle_list')
+        ulist_file = os.path.join(group_dir, 'updated_list')
+        pl_file = open(plist_file, 'w')
+        ul_file = open(ulist_file, 'w')
+        end_part = min(p_count, (i+1)*args.ppi)
+        plist = []
+        ulist = []
+        for j in range(i*args.ppi, end_part):
+            ckpnt_file = os.path.join(group_dir, 'particle'+str(j)+'.ckpnt')
+            new_ckpnt_file = os.path.join(group_dir, 'updated_ckpnt'+str(j)+'.part')
+            plist.append(ckpnt_file)
+            ulist.append(new_ckpnt_file)
+            copyfile(os.path.join(args.checkpoint_dir, cp_files[j]), ckpnt_file)
+
+        pl_file.write(','.join(plist))
+        ul_file.write(','.join(ulist))
+
+        ptrees_file = os.path.join(group_dir, 'particle.trees')
+        plog_file = os.path.join(group_dir, 'particle.log')
+        pxml_file = os.path.join(group_dir, 'beast.xml')
+
+        # remove any taxa and associated sequences that we are not yet ready to add
+        added_taxa.add(taxon)
+        remove_taxa = taxa_to_add.difference(added_taxa)
+        pxml_tree = ET.parse(args.new_xml)
+        taxa = pxml_tree.find('taxa')
+        for t in taxa.findall('taxon'):
+            if t.attrib['id'] in remove_taxa:
+                taxa.remove(t)
+        alignment = pxml_tree.find('alignment')
+        for s in alignment.findall('sequence'):
+            if s[0].attrib['idref'] in remove_taxa: # gets the taxon for the sequence
+                alignment.remove(s)
+
+        # set the desired mcmc chain length
+        mcmc = pxml_tree.find('mcmc')
+        mcmc.attrib['chainLength']=str(args.mcmc_iters)
+
+        # don't log to files
+        for p in mcmc.findall('log/..'):
+            for l in p.findall('log'):
+                if l.attrib['id']=='fileLog':
+                    p.remove(l)
+
+            for lt in p.findall('logTree'):
+                p.remove(lt)
+
+        # TODO: add the targeted operator to the new XML
+        pxml_tree.write(pxml_file)
+
+
+
+parser = argparse.ArgumentParser(description='Add sequences to a BEAST run using SMC.')
+parser.add_argument('--mode', metavar='mode', type=str,
+                    help='[all|prep|filter] mode to run in',
+                    default='all')
+parser.add_argument('--checkpoint_dir', metavar='cpdir', type=str,
+                    help='the location of the BEAST checkpoint directory',
+                    required=False)
+parser.add_argument('--original_xml', type=str, help='The original BEAST XML file',
+                    required=False)
+parser.add_argument('--new_xml', type=str, help='The BEAST XML file with new sequences',
+                    required=False)
+parser.add_argument('--particle_dir', metavar='pdir', type=str,
+                    help='the location of the updated particle directory',
+                    required=False)
+parser.add_argument('--particles', type=int,
+                    help='The number of particles to use', default=10000)
+parser.add_argument('--ppi', type=int,
+                    help='The number of particles to update per BEAST instance', default=100)
+parser.add_argument('--mcmc_iters', type=int,
+                    help='The number of MCMC iterations after each' \
+                    ' sequence addition', default=500)
+parser.add_argument('--beast', type=str, help='The full path to the beast release')
+parser.add_argument('--output', type=str, help='A destination directory for output',
+                    default='output')
+parser.add_argument('--threshold', type=float, help='Resampling threshold. If threshold is positive and less than 1'
+                                                    'then resampling is triggered when ESS < threshold*particles. If'
+                                                    ' threshold > 1 then resampling is triggered when threshold < ESS.',
+                    default=0.5)
+parser.add_argument('--sampling', default='multinomial', choices=['multinomial', 'stratified', 'systematic'],
+                    help='Sampling method')
+parser.add_argument('--overwrite', help='Overwrite output folder', action='store_true')
+args = parser.parse_args()
+
+if os.path.lexists(args.output) and args.overwrite:
+    rmtree(args.output)
+
+resample_stratified = partial(resample_systematic, stratified=True)
+resample = {
+    'systematic': resample_systematic,
+    'stratified': resample_stratified,
+    'multinomial': resample_multinomial,
+}
+
+p_count = args.particles
+
+threshold = args.threshold
+if args.threshold < 1:
+    threshold = args.threshold*p_count
+
+if args.mode == 'all':
+    # this mode runs the nextflow workflow once per new taxon
+    orig_xml_path = os.path.abspath(args.original_xml)
+    new_xml_path = os.path.abspath(args.new_xml)
+    cur_ckpnts = os.path.abspath(args.checkpoint_dir)
+    out_path = os.path.abspath(args.output)
+    # parse the original BEAST XML to get a taxon list
+    orig_taxa_set = parse_taxon_list(orig_xml_path)
+    # parse the new BEAST XML to find the new taxa
+    new_taxa_set = parse_taxon_list(new_xml_path)
+    taxa_to_add = new_taxa_set.difference(orig_taxa_set)
+    os.mkdir(args.output)
+    iter=0
+    for taxon in taxa_to_add:
+        iter_dir = os.path.join(out_path, 'iter.' + str(iter))
+        nf_cmd = 'beast_smc.nf --original_xml=' + orig_xml_path + \
+            ' --new_xml=' + new_xml_path + \
+            ' --ckpnt=' + cur_ckpnts + \
+            ' --out_dir=' + iter_dir + \
+            ' --particles=' + str(args.particles)
+        print(nf_cmd)
+        x = os.system(nf_cmd)
+        if x != 0:
+            exit(x)
+        iter += 1
+        new_xml_path=os.path.join(iter_dir, 'beast.xml')
+        cur_ckpnts=os.path.join(iter_dir,'all_particles')
+
+
+
+if args.mode == 'prep':
+    orig_xml_path = os.path.abspath(args.original_xml)
+    new_xml_path = os.path.abspath(args.new_xml)
+
+    # parse the original BEAST XML to get a taxon list
+    orig_taxa_set = parse_taxon_list(orig_xml_path)
+
+    # parse the new BEAST XML to find the new taxa
+    new_taxa_set = parse_taxon_list(new_xml_path)
+
+    taxa_to_add = new_taxa_set.difference(orig_taxa_set)
+
+    cp_files = os.listdir(args.checkpoint_dir)
+#    cp_files = [f for f in cp_files if f.startswith('beast_state')]
+    if len(cp_files) < args.particles:
+        sys.stderr.write('ERROR: number of particles requested exceeds number '
+        'of MCMC checkpoints. Set --particles to a smaller value or run more MCMC '
+        'on your original data set.\n\n')
+        sys.exit(-1)
+    prep_smc()
+
+if args.mode == 'filter':
+    prev_ll = np.zeros(p_count)
+    new_ll = np.zeros(p_count)
+    weights = np.zeros(p_count)
+    for i in range(p_count):
+        ckpnt_file = os.path.join(args.particle_dir, 'particle'+str(i)+'.ckpnt')
+        new_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt'+str(i)+'.part')
+        prev_ll[i] = read_ll(ckpnt_file)
+        new_ll[i] = read_ll(new_ckpnt_file)
+        weights[i] += new_ll[i] - prev_ll[i]
+
+    # compute the ESS
+    ess = ESS(weights)
+    print("ESS: "+str(ess))
+    print("weights are:")
+    print(weights)
+
+    # optionally do resampling
+    if ess < threshold:
+        print("Resampling")
+        ckpnts = resample[args.sampling](weights)
+        print(ckpnts)
+        weights = [1.0/p_count]*p_count
+        prev_ll = new_ll[ckpnts]
+    else:
+        prev_ll = new_ll
+        ckpnts = range(p_count)
+
+    instances = math.ceil(p_count / args.ppi)
+    for i in range(instances):
+        group_dir = os.path.join(args.output, "group."+str(i))
+        os.mkdir(group_dir)
+        copy2(args.new_xml, group_dir)
+
+    for i in range(len(ckpnts)):
+        src_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt'+str(ckpnts[i])+'.part')
+        group_dir = os.path.join(args.output, "group."+str(math.floor(i/args.ppi)))
+        dest_ckpnt_file = os.path.join(group_dir, 'particle'+str(i)+'.part')
+        copy2(src_ckpnt_file, dest_ckpnt_file)
