@@ -170,7 +170,7 @@ parser.add_argument('--ppi', type=int,
 parser.add_argument('--mcmc_iters', type=int,
                     help='The number of MCMC iterations after each' \
                     ' sequence addition', default=500)
-parser.add_argument('--beast', type=str, help='The full path to the beast release')
+parser.add_argument('--nxfconfig', type=str, help='A nextflow configuration file')
 parser.add_argument('--output', type=str, help='A destination directory for output',
                     default='output')
 parser.add_argument('--threshold', type=float, help='Resampling threshold. If threshold is positive and less than 1'
@@ -213,7 +213,10 @@ if args.mode == 'all':
     iter=0
     for taxon in taxa_to_add:
         iter_dir = os.path.join(out_path, 'iter.' + str(iter))
-        nf_cmd = 'beast_smc.nf --original_xml=' + orig_xml_path + \
+        nf_cmd = 'beast_smc.nf '
+        if args.nxfconfig is not None:
+            nf_cmd += ' -c '+args.nxfconfig
+        nf_cmd += ' --original_xml=' + orig_xml_path + \
             ' --new_xml=' + new_xml_path + \
             ' --ckpnt=' + cur_ckpnts + \
             ' --out_dir=' + iter_dir + \

@@ -24,7 +24,7 @@ process update_particles {
   file("${particle_group}") into updated
 
   """
-  java -cp beast.jar dr.app.realtime.CheckPointUpdaterApp  -load_state `cat ${particle_group}/particle_list` -update_choice F84Distance -output_file `cat ${particle_group}/updated_list` -BEAST_XML ${particle_group}/beast.xml
+  java -cp \$BEASTJAR dr.app.realtime.CheckPointUpdaterApp  -load_state `cat ${particle_group}/particle_list` -update_choice F84Distance -output_file `cat ${particle_group}/updated_list` -BEAST_XML ${particle_group}/beast.xml
   """
 }
 
@@ -55,7 +55,7 @@ process run_mcmc {
   file("${group_dir}.updated") into mcmc
 
   """
-  java -cp beast.jar dr.app.beast.BeastMain -particles ${group_dir} ${group_dir}/beast.xml
+  java -cp \$BEASTJAR dr.app.beast.BeastMain -particles ${group_dir} ${group_dir}/beast.xml
   mkdir ${group_dir}.updated
   mv ${group_dir}/*.out ${group_dir}.updated/
   cp ${group_dir}/beast.xml ${group_dir}.updated/
