@@ -36,16 +36,19 @@ process filter_particles {
 
   output:
   file("result/*") into filtered_particles mode flatten
+  file("smc_filter.out") into filter_info
 
   """
   mkdir iteration
   mv group*/*.ckpnt group*/*.part iteration
   mkdir filtered
-  beast_smc_modular --mode=filter --particle_dir iteration --particles ${params.particles} --output filtered --new_xml group.0/beast.xml --ppi ${params.particles_per_instance}
+  beast_smc_modular --mode=filter --particle_dir iteration --particles ${params.particles} --output filtered --new_xml group.0/beast.xml --ppi ${params.particles_per_instance} 2> smc_filter.err > smc_filter.out
   mkdir result
   mv filtered/* result
   """
 }
+
+filter_info.collectFile(storeDir: params.out_dir)
 
 process run_mcmc {
   input:
