@@ -226,7 +226,7 @@ if args.mode == 'all':
         if x != 0:
             exit(x)
         iter += 1
-        new_xml_path=os.path.join(iter_dir, 'beast.xml')
+        orig_xml_path=os.path.join(iter_dir, 'beast.xml')
         cur_ckpnts=os.path.join(iter_dir,'all_particles')
 
 
