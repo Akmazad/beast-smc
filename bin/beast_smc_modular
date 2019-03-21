@@ -179,6 +179,8 @@ parser.add_argument('--threshold', type=float, help='Resampling threshold. If th
                     default=0.5)
 parser.add_argument('--sampling', default='multinomial', choices=['multinomial', 'stratified', 'systematic'],
                     help='Sampling method')
+parser.add_argument('--weights', type=str, help='Weights at previous iteration',
+                    required=False)
 parser.add_argument('--overwrite', help='Overwrite output folder', action='store_true')
 args = parser.parse_args()
 
@@ -210,9 +212,19 @@ if args.mode == 'all':
     new_taxa_set = parse_taxon_list(new_xml_path)
     taxa_to_add = new_taxa_set.difference(orig_taxa_set)
     os.mkdir(args.output)
+    os.mkdir(os.path.join(out_path, 'iter.0'))
+
+    with open(os.path.join(out_path, 'iter.0', 'weights.csv'), 'w') as fp:
+        fp.write(','.join(['0']*args.particles))
+
     iter=0
     for taxon in taxa_to_add:
         iter_dir = os.path.join(out_path, 'iter.' + str(iter))
+        weights_file = os.path.join(iter_dir, 'weights.csv')
+        if iter > 0:
+            os.mkdir(iter_dir)
+            copy2(os.path.join(out_path, 'iter.{}'.format(iter-1), 'weights-resampled.csv'),
+                weights_file)
         nf_cmd = 'beast_smc.nf '
         if args.nxfconfig is not None:
             nf_cmd += ' -c '+args.nxfconfig
@@ -220,6 +232,8 @@ if args.mode == 'all':
             ' --new_xml=' + new_xml_path + \
             ' --ckpnt=' + cur_ckpnts + \
             ' --out_dir=' + iter_dir + \
+            ' --weights=' + weights_file + \
+            ' --threshold=' + str(args.threshold) + \
             ' --particles=' + str(args.particles)
         print(nf_cmd)
         x = os.system(nf_cmd)
@@ -255,7 +269,10 @@ if args.mode == 'prep':
 if args.mode == 'filter':
     prev_ll = np.zeros(p_count)
     new_ll = np.zeros(p_count)
-    weights = np.zeros(p_count)
+    with open(args.weights) as fp:
+        line = fp.read()
+        weights = np.array([float(x) for x in line.split(',')])
+
     for i in range(p_count):
         ckpnt_file = os.path.join(args.particle_dir, 'particle'+str(i)+'.ckpnt')
         new_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt'+str(i)+'.part')
@@ -274,11 +291,14 @@ if args.mode == 'filter':
         print("Resampling")
         ckpnts = resample[args.sampling](weights)
         print(ckpnts)
-        weights = [1.0/p_count]*p_count
+        weights = [0]*p_count
         prev_ll = new_ll[ckpnts]
     else:
         prev_ll = new_ll
         ckpnts = range(p_count)
+
+    with open('weights-resampled.csv', 'w') as fp:
+        fp.write(','.join([str(x) for x in weights]))
 
     instances = math.ceil(p_count / args.ppi)
     for i in range(instances):
