@@ -87,11 +87,25 @@ def read_ll(checkpoint_file):
     return 0 #TODO: throw an error here
 
 
+def add_subtree_leap_operator(parent, size, weight, treeModel, taxa=None):
+    if taxa is not None:
+        op = ET.SubElement(parent, 'tipLeap', {'size': size, 'weight': weight})
+        ET.SubElement(op, 'treeModel', {'idref': treeModel})
+        taxaElement = ET.SubElement(op, 'taxa')
+        if isinstance(taxa, str):
+            ET.SubElement(taxaElement, 'taxon', {'idref': taxa})
+        else:
+            for taxon in list(taxa):
+                ET.SubElement(taxaElement, 'taxon', {'idref': taxon})
+    else:
+        ET.SubElement(parent, 'subtreeLeap', {'size': size, 'weight': weight})
+
+
 def prep_smc():
     # set up particles from MCMC checkpoints
     ckpnts = range(p_count)
 
-    taxon = next(iter(taxa_to_add))
+    taxon = args.taxon
     added_taxa = set()
     instances = math.ceil(p_count / args.ppi)
     for i in range(instances):
@@ -105,7 +119,7 @@ def prep_smc():
         plist = []
         ulist = []
         for j in range(i*args.ppi, end_part):
-            ckpnt_file = os.path.join(group_dir, 'particle'+str(j)+'.ckpnt')
+            ckpnt_file = os.path.join(group_dir, args.state_stem + '_'+str(j)+'.ckpnt')
             new_ckpnt_file = os.path.join(group_dir, 'updated_ckpnt'+str(j)+'.part')
             plist.append(ckpnt_file)
             ulist.append(new_ckpnt_file)
@@ -122,6 +136,19 @@ def prep_smc():
         added_taxa.add(taxon)
         remove_taxa = taxa_to_add.difference(added_taxa)
         pxml_tree = ET.parse(args.new_xml)
+
+        # from the second iteration the state files contain tipLeap operator but not new_xml
+        operatorsElement = pxml_tree.find('operators')
+        if operatorsElement.find('tipLeap') is None:
+            first_ckpnt_file = os.path.join(group_dir, args.state_stem + '_' + str(i * args.ppi) + '.ckpnt')
+            with open(first_ckpnt_file) as fp:
+                if 'tipLeap' in fp.read():
+                    treeModelElement = pxml_tree.find('treeModel')
+                    # TODO: initialize with a better weight
+                    # In this case we don't care about the size value
+                    # since it is going to be overwritten by the state file
+                    add_subtree_leap_operator(operatorsElement, '1', '1', treeModelElement.attrib['id'], taxon)
+
         taxa = pxml_tree.find('taxa')
         for t in taxa.findall('taxon'):
             if t.attrib['id'] in remove_taxa:
@@ -146,7 +173,6 @@ def prep_smc():
 
         # TODO: add the targeted operator to the new XML
         pxml_tree.write(pxml_file)
-
 
 
 parser = argparse.ArgumentParser(description='Add sequences to a BEAST run using SMC.')
@@ -181,6 +207,8 @@ parser.add_argument('--sampling', default='multinomial', choices=['multinomial',
                     help='Sampling method')
 parser.add_argument('--weights', type=str, help='Weights at previous iteration',
                     required=False)
+parser.add_argument('--state_stem', type=str, default='beast_state', help='Stem of state files from BEAST')
+parser.add_argument('--taxon', type=str, help='New taxon', required=False)
 parser.add_argument('--overwrite', help='Overwrite output folder', action='store_true')
 args = parser.parse_args()
 
@@ -234,7 +262,8 @@ if args.mode == 'all':
             ' --out_dir=' + iter_dir + \
             ' --weights=' + weights_file + \
             ' --threshold=' + str(args.threshold) + \
-            ' --particles=' + str(args.particles)
+            ' --particles=' + str(args.particles) + \
+            ' --taxon={}'.format(taxon)
         print(nf_cmd)
         x = os.system(nf_cmd)
         if x != 0:
@@ -258,7 +287,7 @@ if args.mode == 'prep':
     taxa_to_add = new_taxa_set.difference(orig_taxa_set)
 
     cp_files = os.listdir(args.checkpoint_dir)
-#    cp_files = [f for f in cp_files if f.startswith('beast_state')]
+    cp_files = [f for f in cp_files if f.startswith(args.state_stem)]
     if len(cp_files) < args.particles:
         sys.stderr.write('ERROR: number of particles requested exceeds number '
         'of MCMC checkpoints. Set --particles to a smaller value or run more MCMC '
@@ -274,7 +303,7 @@ if args.mode == 'filter':
         weights = np.array([float(x) for x in line.split(',')])
 
     for i in range(p_count):
-        ckpnt_file = os.path.join(args.particle_dir, 'particle'+str(i)+'.ckpnt')
+        ckpnt_file = os.path.join(args.particle_dir, args.state_stem + '_'+str(i)+'.ckpnt')
         new_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt'+str(i)+'.part')
         prev_ll[i] = read_ll(ckpnt_file)
         new_ll[i] = read_ll(new_ckpnt_file)
@@ -301,13 +330,47 @@ if args.mode == 'filter':
         fp.write(','.join([str(x) for x in weights]))
 
     instances = math.ceil(p_count / args.ppi)
-    for i in range(instances):
-        group_dir = os.path.join(args.output, "group."+str(i))
-        os.mkdir(group_dir)
-        copy2(args.new_xml, group_dir)
 
-    for i in range(len(ckpnts)):
-        src_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt'+str(ckpnts[i])+'.part')
-        group_dir = os.path.join(args.output, "group."+str(math.floor(i/args.ppi)))
-        dest_ckpnt_file = os.path.join(group_dir, 'particle'+str(i)+'.part')
-        copy2(src_ckpnt_file, dest_ckpnt_file)
+    pxml_tree = ET.parse(args.new_xml)
+    operatorsElement = pxml_tree.find('operators')
+    tipLeapOperator = operatorsElement.find('tipLeap')
+    # only called during the first iteration
+    if tipLeapOperator is None:
+        treeModelElement = pxml_tree.find('treeModel')
+        # size value is going to change from the state file
+        # TODO: initialize with a better weight
+        add_subtree_leap_operator(operatorsElement, '2', '1', treeModelElement.attrib['id'], args.taxon)
+
+        for i in range(instances):
+            group_dir = os.path.join(args.output, "group." + str(i))
+            os.mkdir(group_dir)
+            pxml_tree.write(os.path.join(group_dir, os.path.basename(args.new_xml)))
+
+        for i in range(len(ckpnts)):
+            src_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt' + str(ckpnts[i]) + '.part')
+            group_dir = os.path.join(args.output, "group." + str(math.floor(i / args.ppi)))
+            dest_ckpnt_file = os.path.join(group_dir, args.state_stem + '_' + str(i) + '.part')
+
+            with open(src_ckpnt_file) as fp:
+                content = fp.readlines()
+            op = False
+            for i, line in enumerate(content):
+                if line.startswith('operator'):
+                    op = True
+                elif not line.startswith('operator') and op:
+                    # TODO: initialize with appropriate size (last value)
+                    content.insert(i, 'operator\ttipLeap({})\t0\t0\t3\n'.format(treeModelElement.attrib['id']))
+                    break
+            with open(dest_ckpnt_file, 'w') as fp:
+                fp.write(''.join(content))
+    else:
+        for i in range(instances):
+            group_dir = os.path.join(args.output, "group." + str(i))
+            os.mkdir(group_dir)
+            copy2(args.new_xml, group_dir)
+
+        for i in range(len(ckpnts)):
+            src_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt' + str(ckpnts[i]) + '.part')
+            group_dir = os.path.join(args.output, "group." + str(math.floor(i / args.ppi)))
+            dest_ckpnt_file = os.path.join(group_dir, args.state_stem + '_' + str(i) + '.part')
+            copy2(src_ckpnt_file, dest_ckpnt_file)

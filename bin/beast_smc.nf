@@ -12,7 +12,7 @@ process prep_smc_iter {
    file("group*") into particles mode flatten
 
    """
-   beast_smc_modular --mode=prep --checkpoint_dir ${params.ckpnt} --original_xml ${xmlfile} --new_xml ${params.new_xml} --particles ${params.particles} --output . --ppi ${params.particles_per_instance}
+   beast_smc_modular --mode=prep --checkpoint_dir ${params.ckpnt} --original_xml ${xmlfile} --new_xml ${params.new_xml} --particles ${params.particles} --output . --ppi ${params.particles_per_instance} --taxon ${params.taxon}
    """
 }
 
@@ -43,7 +43,7 @@ process filter_particles {
   mkdir iteration
   mv group*/*.ckpnt group*/*.part iteration
   mkdir filtered
-  beast_smc_modular --mode=filter --particle_dir iteration --particles ${params.particles} --output filtered --new_xml group.0/beast.xml --ppi ${params.particles_per_instance}  --threshold ${params.threshold} --weights ${params.weights} 2> smc_filter.err > smc_filter.out
+  beast_smc_modular --mode=filter --particle_dir iteration --particles ${params.particles} --output filtered --new_xml group.0/beast.xml --ppi ${params.particles_per_instance}  --threshold ${params.threshold} --weights ${params.weights} --taxon ${params.taxon} 2> smc_filter.err > smc_filter.out
   mkdir result
   mv filtered/* result
   """
