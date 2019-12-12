@@ -10,9 +10,10 @@ process prep_smc_iter {
 
    output:
    file("group*") into particles mode flatten
+   file("group*") into groups  mode flatten
 
    """
-   beast_smc_modular --mode=prep --checkpoint_dir ${params.ckpnt} --original_xml ${xmlfile} --new_xml ${params.new_xml} --particles ${params.particles} --output . --ppi ${params.particles_per_instance} --taxon ${params.taxon}
+   beast_smc_modular --mode=prep --checkpoint_dir ${params.ckpnt} --original_xml ${xmlfile} --new_xml ${params.new_xml} --particles ${params.particles} --output . --ppi ${params.particles_per_instance} --taxon "${params.taxon}" --state_stem ${params.stem}
    """
 }
 
@@ -24,7 +25,7 @@ process update_particles {
   file("${particle_group}") into updated
 
   """
-  java -cp \$BEASTJAR dr.app.realtime.CheckPointUpdaterApp  -load_state `cat ${particle_group}/particle_list` -update_choice F84Distance -output_file `cat ${particle_group}/updated_list` -BEAST_XML ${particle_group}/beast.xml
+  java -cp \$BEASTJAR dr.app.realtime.CheckPointUpdaterApp  -load_state ${particle_group}/checkpt.zip -update_choice ${params.update_choice} -output_file ${particle_group}/checkpt-updated.zip -BEAST_XML ${particle_group}/beast.xml
   """
 }
 
@@ -35,53 +36,31 @@ process filter_particles {
   file("*") from all_updated_particles
 
   output:
-  file("result/*") into filtered_particles mode flatten
+  file("group*/checkpt-resampled.zip") into filtered_particles mode flatten
   file("smc_filter.out") into filter_info
   file("weights-resampled.csv") into filter_weights
+  file("group.0/beast.xml") into beast_xml
 
   """
-  mkdir iteration
-  mv group*/*.ckpnt group*/*.part iteration
-  mkdir filtered
-  beast_smc_modular --mode=filter --particle_dir iteration --particles ${params.particles} --output filtered --new_xml group.0/beast.xml --ppi ${params.particles_per_instance}  --threshold ${params.threshold} --weights ${params.weights} --taxon ${params.taxon} 2> smc_filter.err > smc_filter.out
-  mkdir result
-  mv filtered/* result
+  beast_smc_modular --mode=filter --particle_dir . --particles ${params.particles} --output . --new_xml group.0/beast.xml --ppi ${params.particles_per_instance}  --threshold ${params.threshold} --weights ${params.weights} --taxon "${params.taxon}" --state_stem ${params.stem} 2> smc_filter.err > smc_filter.out
   """
 }
 
 filter_info.collectFile(storeDir: params.out_dir)
 filter_weights.collectFile(storeDir: params.out_dir)
+beast_xml.collectFile(storeDir: params.out_dir)
 
 process run_mcmc {
-  input:
-  file(group_dir) from filtered_particles
-
-  output:
-  file("${group_dir}.updated") into mcmc
-
-  """
-  java -cp \$BEASTJAR dr.app.beast.BeastMain -particles ${group_dir} ${group_dir}/beast.xml
-  mkdir ${group_dir}.updated
-  mv ${group_dir}/*.out ${group_dir}.updated/
-  cp ${group_dir}/beast.xml ${group_dir}.updated/
-  """
-}
-
-all_mcmc_particles = mcmc.collect()
-
-process combine_particles {
   publishDir params.out_dir
 
   input:
-  file(group_dir) from all_mcmc_particles
+  file(group) from groups
+  file(resampled_zip) from filtered_particles
 
   output:
-  file("all_particles")
-  file("beast.xml")
+  file("${group}/checkpt-resampled.out.zip") into mcmc
 
   """
-  mkdir all_particles
-  mv group.*/*.out all_particles
-  cp group.0.updated/beast.xml .
+  java -cp \$BEASTJAR dr.app.beast.BeastMain -particles ${group}/${resampled_zip} ${group}/beast.xml
   """
 }

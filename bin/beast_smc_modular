@@ -11,6 +11,8 @@ import xml.etree.ElementTree as ET
 from shutil import copyfile, rmtree, copy2
 import numpy as np
 from functools import partial
+import zipfile
+
 
 def resample_multinomial(weights):
     w = np.exp(weights)
@@ -78,12 +80,14 @@ def parse_taxon_list(xml_path):
     return taxa_set
 
 
-def read_ll(checkpoint_file):
-    wf = open(checkpoint_file, 'r')
-    for line in wf:
+def parse_ll(checkpoint_str):
+    for line in checkpoint_str.splitlines():
         if line.startswith('lnL'):
             ll = line.split('\t')
-            return float(ll[1])
+            if len(ll) == 2:
+                return float(ll[1]), 0
+            else:
+                return float(ll[1]), float(ll[2])
     return 0 #TODO: throw an error here
 
 
@@ -103,52 +107,71 @@ def add_subtree_leap_operator(parent, size, weight, treeModel, taxa=None):
 
 def prep_smc():
     # set up particles from MCMC checkpoints
-    ckpnts = range(p_count)
-
     taxon = args.taxon
-    added_taxa = set()
+    added_taxa = {taxon}
     instances = math.ceil(p_count / args.ppi)
+
+    zip_mode = zipfile.is_zipfile(args.checkpoint_dir)
+
+    # first iteration checkpoint_dir is a single zip file containing checkpoint files
+    if zip_mode:
+        input_zip = zipfile.ZipFile(args.checkpoint_dir)
+        cp_files = [info.filename for info in input_zip.infolist()
+                    if info.filename.startswith(args.state_stem) and not info.filename.endswith('/')]
+
+        index_cp_file = 0
+        for i in range(instances):
+            group_dir = os.path.join(args.output, "group."+str(i))
+            os.mkdir(group_dir)
+            group_zip = zipfile.ZipFile(os.path.join(group_dir, 'checkpt.zip'), mode='w',
+                                        compression=zipfile.ZIP_DEFLATED, compresslevel=8)
+            end_part = min(p_count, (i + 1) * args.ppi)
+            for j in range(i * args.ppi, end_part):
+                # checkpoint files are recycled when the number of particles requested is higher than the number
+                # of checkpoint files
+                if index_cp_file >= len(cp_files):
+                    index_cp_file = 0
+                with input_zip.open(cp_files[index_cp_file], 'r') as ckpnt_file:
+                    group_zip.writestr('{}_{}.ckpnt'.format(args.state_stem, j), ckpnt_file.read())
+                index_cp_file += 1
+            group_zip.close()
+        input_zip.close()
+    else:
+        for f in os.listdir(args.checkpoint_dir):
+            if f.startswith('group'):
+                group_dir = os.path.join(args.output, f)
+                os.mkdir(group_dir)
+                for f2 in os.listdir(os.path.join(args.checkpoint_dir, f)):
+                    if f2.endswith('.zip'):
+                        copy2(os.path.join(args.checkpoint_dir, f, f2), os.path.join(group_dir, 'checkpt.zip'))
+
     for i in range(instances):
         group_dir = os.path.join(args.output, "group."+str(i))
-        os.mkdir(group_dir)
-        plist_file = os.path.join(group_dir, 'particle_list')
-        ulist_file = os.path.join(group_dir, 'updated_list')
-        pl_file = open(plist_file, 'w')
-        ul_file = open(ulist_file, 'w')
-        end_part = min(p_count, (i+1)*args.ppi)
-        plist = []
-        ulist = []
-        for j in range(i*args.ppi, end_part):
-            ckpnt_file = os.path.join(group_dir, args.state_stem + '_'+str(j)+'.ckpnt')
-            new_ckpnt_file = os.path.join(group_dir, 'updated_ckpnt'+str(j)+'.part')
-            plist.append(ckpnt_file)
-            ulist.append(new_ckpnt_file)
-            copyfile(os.path.join(args.checkpoint_dir, cp_files[j]), ckpnt_file)
-
-        pl_file.write(','.join(plist))
-        ul_file.write(','.join(ulist))
-
         ptrees_file = os.path.join(group_dir, 'particle.trees')
         plog_file = os.path.join(group_dir, 'particle.log')
         pxml_file = os.path.join(group_dir, 'beast.xml')
 
         # remove any taxa and associated sequences that we are not yet ready to add
-        added_taxa.add(taxon)
         remove_taxa = taxa_to_add.difference(added_taxa)
         pxml_tree = ET.parse(args.new_xml)
 
         # from the second iteration the state files contain tipLeap operator but not new_xml
         operatorsElement = pxml_tree.find('operators')
-        if operatorsElement.find('tipLeap') is None:
-            first_ckpnt_file = os.path.join(group_dir, args.state_stem + '_' + str(i * args.ppi) + '.ckpnt')
-            with open(first_ckpnt_file) as fp:
-                if 'tipLeap' in fp.read():
+        if use_tip_leap and operatorsElement.find('tipLeap') is None:
+            if zip_mode:
+                group_zip = zipfile.ZipFile(os.path.join(group_dir, 'checkpt.zip'), mode='r')
+            else:
+                group_zip = zipfile.ZipFile(os.path.join(args.checkpoint_dir, 'group.'+str(i), 'checkpt-resampled.out.zip'), mode='r')
+            first_ckpnt_file = args.state_stem + '_' + str(i * args.ppi) + '.ckpnt'
+            #first_ckpnt_file = os.path.join(group_dir, args.state_stem + '_' + str(i * args.ppi) + '.ckpnt')
+            with group_zip.open(first_ckpnt_file, 'r') as fp:
+                if 'tipLeap' in str(fp.read()):
                     treeModelElement = pxml_tree.find('treeModel')
                     # TODO: initialize with a better weight
                     # In this case we don't care about the size value
                     # since it is going to be overwritten by the state file
                     add_subtree_leap_operator(operatorsElement, '1', '1', treeModelElement.attrib['id'], taxon)
-
+            group_zip.close()
         taxa = pxml_tree.find('taxa')
         for t in taxa.findall('taxon'):
             if t.attrib['id'] in remove_taxa:
@@ -210,6 +233,9 @@ parser.add_argument('--weights', type=str, help='Weights at previous iteration',
 parser.add_argument('--state_stem', type=str, default='beast_state', help='Stem of state files from BEAST')
 parser.add_argument('--taxon', type=str, help='New taxon', required=False)
 parser.add_argument('--overwrite', help='Overwrite output folder', action='store_true')
+parser.add_argument('--update_choice', default='F84Distance',
+                    choices=['JC69Distance', 'F84Distance', 'Simple', 'stochastic'],
+                    help='Update mechanism of CheckPointUpdaterApp')
 args = parser.parse_args()
 
 if os.path.lexists(args.output) and args.overwrite:
@@ -228,11 +254,14 @@ threshold = args.threshold
 if args.threshold < 1:
     threshold = args.threshold*p_count
 
+use_tip_leap = False
+
 if args.mode == 'all':
     # this mode runs the nextflow workflow once per new taxon
     orig_xml_path = os.path.abspath(args.original_xml)
     new_xml_path = os.path.abspath(args.new_xml)
     cur_ckpnts = os.path.abspath(args.checkpoint_dir)
+    zip_mode = zipfile.is_zipfile(cur_ckpnts)
     out_path = os.path.abspath(args.output)
     # parse the original BEAST XML to get a taxon list
     orig_taxa_set = parse_taxon_list(orig_xml_path)
@@ -245,8 +274,7 @@ if args.mode == 'all':
     with open(os.path.join(out_path, 'iter.0', 'weights.csv'), 'w') as fp:
         fp.write(','.join(['0']*args.particles))
 
-    iter=0
-    for taxon in taxa_to_add:
+    for iter, taxon in enumerate(taxa_to_add):
         iter_dir = os.path.join(out_path, 'iter.' + str(iter))
         weights_file = os.path.join(iter_dir, 'weights.csv')
         if iter > 0:
@@ -263,15 +291,17 @@ if args.mode == 'all':
             ' --weights=' + weights_file + \
             ' --threshold=' + str(args.threshold) + \
             ' --particles=' + str(args.particles) + \
-            ' --taxon={}'.format(taxon)
+            ' --particles_per_instance=' + str(args.ppi) + \
+            ' --stem={}'.format(args.state_stem) + \
+            ' --taxon="{}"'.format(taxon) + \
+            ' --update_choice={}'.format(args.update_choice)
         print(nf_cmd)
         x = os.system(nf_cmd)
         if x != 0:
             exit(x)
         iter += 1
         orig_xml_path=os.path.join(iter_dir, 'beast.xml')
-        cur_ckpnts=os.path.join(iter_dir,'all_particles')
-
+        cur_ckpnts=os.path.join(iter_dir)
 
 
 if args.mode == 'prep':
@@ -286,34 +316,41 @@ if args.mode == 'prep':
 
     taxa_to_add = new_taxa_set.difference(orig_taxa_set)
 
-    cp_files = os.listdir(args.checkpoint_dir)
-    cp_files = [f for f in cp_files if f.startswith(args.state_stem)]
-    if len(cp_files) < args.particles:
-        sys.stderr.write('ERROR: number of particles requested exceeds number '
-        'of MCMC checkpoints. Set --particles to a smaller value or run more MCMC '
-        'on your original data set.\n\n')
-        sys.exit(-1)
     prep_smc()
 
 if args.mode == 'filter':
     prev_ll = np.zeros(p_count)
     new_ll = np.zeros(p_count)
+    proposal_lp = np.zeros(p_count)
     with open(args.weights) as fp:
         line = fp.read()
         weights = np.array([float(x) for x in line.split(',')])
 
-    for i in range(p_count):
-        ckpnt_file = os.path.join(args.particle_dir, args.state_stem + '_'+str(i)+'.ckpnt')
-        new_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt'+str(i)+'.part')
-        prev_ll[i] = read_ll(ckpnt_file)
-        new_ll[i] = read_ll(new_ckpnt_file)
-        weights[i] += new_ll[i] - prev_ll[i]
+    instances = math.ceil(p_count / args.ppi)
+    i = 0
+    for instance in range(instances):
+        group_zip = zipfile.ZipFile(os.path.join(args.particle_dir, "group." + str(instance), 'checkpt.zip'))
+        new_group_zip = zipfile.ZipFile(
+            os.path.join(args.particle_dir, "group." + str(instance), 'checkpt-updated.zip'))
+        for info in group_zip.infolist():
+            with group_zip.open(info.filename, 'r') as f:
+                prev_ll[i], _ = parse_ll(f.read().decode("utf-8"))
+            with new_group_zip.open(info.filename, 'r') as f:
+                new_ll[i], proposal_lp[i] = parse_ll(f.read().decode("utf-8"))
+
+            weights[i] += new_ll[i] - prev_ll[i] - proposal_lp[i]
+            i += 1
+        group_zip.close()
+        new_group_zip.close()
 
     # compute the ESS
     ess = ESS(weights)
-    print("ESS: "+str(ess))
+    print("ESS: " + str(ess))
     print("weights are:")
     print(weights)
+    print(new_ll)
+    print(prev_ll)
+    print(proposal_lp)
 
     # optionally do resampling
     if ess < threshold:
@@ -335,7 +372,7 @@ if args.mode == 'filter':
     operatorsElement = pxml_tree.find('operators')
     tipLeapOperator = operatorsElement.find('tipLeap')
     # only called during the first iteration
-    if tipLeapOperator is None:
+    if use_tip_leap and tipLeapOperator is None:
         treeModelElement = pxml_tree.find('treeModel')
         # size value is going to change from the state file
         # TODO: initialize with a better weight
@@ -343,34 +380,42 @@ if args.mode == 'filter':
 
         for i in range(instances):
             group_dir = os.path.join(args.output, "group." + str(i))
-            os.mkdir(group_dir)
+            # os.mkdir(group_dir)
             pxml_tree.write(os.path.join(group_dir, os.path.basename(args.new_xml)))
 
-        for i in range(len(ckpnts)):
-            src_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt' + str(ckpnts[i]) + '.part')
-            group_dir = os.path.join(args.output, "group." + str(math.floor(i / args.ppi)))
-            dest_ckpnt_file = os.path.join(group_dir, args.state_stem + '_' + str(i) + '.part')
+    group_zip = None
+    group_id_current = -1
+    resampled_group_zip = None
+    resampled_group_id_current = -1
+    for i, ckpnt in enumerate(sorted(ckpnts)):
+        group_id = math.floor(ckpnt / args.ppi)
+        resampled_group_id = math.floor(i / args.ppi)
+        if group_id != group_id_current:
+            if group_zip is not None:
+                group_zip.close()
+            group_dir = os.path.join(args.output, "group." + str(group_id))
+            group_zip = zipfile.ZipFile(os.path.join(group_dir, 'checkpt-updated.zip'), mode='r')
+            group_id_current = group_id
+        if resampled_group_id != resampled_group_id_current:
+            if resampled_group_zip is not None:
+                resampled_group_zip.close()
+            resampled_group_zip = zipfile.ZipFile(
+                os.path.join(args.output, "group." + str(resampled_group_id), 'checkpt-resampled.zip'), mode='w',
+                compression=zipfile.ZIP_DEFLATED, compresslevel=8)
+            resampled_group_id_current = resampled_group_id
 
-            with open(src_ckpnt_file) as fp:
-                content = fp.readlines()
-            op = False
-            for i, line in enumerate(content):
-                if line.startswith('operator'):
-                    op = True
-                elif not line.startswith('operator') and op:
-                    # TODO: initialize with appropriate size (last value)
-                    content.insert(i, 'operator\ttipLeap({})\t0\t0\t3\n'.format(treeModelElement.attrib['id']))
-                    break
-            with open(dest_ckpnt_file, 'w') as fp:
-                fp.write(''.join(content))
-    else:
-        for i in range(instances):
-            group_dir = os.path.join(args.output, "group." + str(i))
-            os.mkdir(group_dir)
-            copy2(args.new_xml, group_dir)
-
-        for i in range(len(ckpnts)):
-            src_ckpnt_file = os.path.join(args.particle_dir, 'updated_ckpnt' + str(ckpnts[i]) + '.part')
-            group_dir = os.path.join(args.output, "group." + str(math.floor(i / args.ppi)))
-            dest_ckpnt_file = os.path.join(group_dir, args.state_stem + '_' + str(i) + '.part')
-            copy2(src_ckpnt_file, dest_ckpnt_file)
+        # read particle from *updated.zip and write particle to *resampled.zip
+        with group_zip.open('{}_{}.ckpnt'.format(args.state_stem, ckpnt)) as ckpnt_file:
+            content = ckpnt_file.read().decode('utf-8').splitlines()
+            if use_tip_leap and tipLeapOperator is None:
+                op = False
+                for k, line in enumerate(content):
+                    if line.startswith('operator'):
+                        op = True
+                    elif not line.startswith('operatjoinor') and op:
+                        # TODO: initialize with appropriate size (last value)
+                        content.insert(k, 'operator\ttipLeap({})\t0\t0\t0.1'.format(treeModelElement.attrib['id']))
+                        break
+            resampled_group_zip.writestr('{}_{}.ckpnt'.format(args.state_stem, i), '\n'.join(content))
+    group_zip.close()
+    resampled_group_zip.close()
